@@ -26,23 +26,11 @@ Programın çalışması için aşağıdaki bağımlılıkların sisteminizde ku
 
 Rust & Cargo: rustup.rs üzerinden kurulum yapabilirsiniz.
 
-WinPcap / Npcap: Proje Windows üzerinde çalıştığı için ağ trafiğini yakalayabilmek adına Npcap sürücülerine ihtiyaç duyar (Kurulumda "Install Npcap in WinPcap API-compatible Mode" seçeneğini işaretlemeyi unutmayın).
-
- Kurulum
-
-Depoyu klonlayın
-
-Projeyi derleyin:
-
-cargo build --release
-
+WinPcap / Npcap: Proje Windows üzerinde çalıştığı için ağ trafiğini yakalayabilmek adına Npcap sürücülerine ihtiyaç duyar 
 
  Çalıştırma
 
 Ağ paketlerini yakalamak düşük seviyeli erişim gerektirdiği için programı Yönetici olarak çalıştırmanız zorunludur.
-
-cargo run --release
-
 
 Program başladığında sisteminizdeki ağ adaptörlerini listeleyecektir. İzlemek istediğiniz adaptörün numarasını girerek süreci başlatabilirsiniz.
 

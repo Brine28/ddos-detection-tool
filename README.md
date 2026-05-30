@@ -16,8 +16,6 @@ Single IP Flood: Tek bir kaynaktan gelen anormal trafik yoğunluğunu saptar.
 
 Güvenli Tasarım: OOM (Out-of-Memory) hatalarını önlemek için tamponlu kanal (sync_channel) yapısı kullanır.
 
-Loglama: Tespit edilen tüm anomali kayıtlarını ddos_alerts.json dosyasına JSON formatında yedekler.
-
 Terminal Arayüzü: Renkli ve anlaşılır terminal çıktıları.
 
 Gereksinimler

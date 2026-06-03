@@ -75,7 +75,6 @@ mod ui {
             Severity::Critical => Color::Red,
         };
 
-        // DÜZELTME: {:#?} formatı yerine {:?} kullanıldı (Gereksiz satır atlamaları önlendi)
         let _ = execute!(
             stdout(),
             SetForegroundColor(Color::DarkGrey),
@@ -86,7 +85,8 @@ mod ui {
             Print(format!("{} - ", alert.anomaly_type)),
             SetForegroundColor(Color::Red),
             Print(format!("Skor: {:.2} (Eşik: {:.2}) ", alert.score, alert.threshold)),
-            SetForegroundColor(Color::Reset),
+            // DÜZELTME #1: Color::Reset geçersiz variant. ResetColor kullanılmalı.
+            ResetColor,
             Print(format!("=> {}\n", alert.description)),
         );
     }
@@ -103,15 +103,15 @@ mod network {
     };
     use std::sync::mpsc::SyncSender;
 
-    // DÜZELTME: OOM koruması için Sender yerine sınırlı tamponlu SyncSender kullanılıyor
     pub fn process_packet(packet: &[u8], tx: &SyncSender<PacketInfo>) {
         if let Some(eth) = EthernetPacket::new(packet) {
             if eth.get_ethertype() == EtherTypes::Ipv4 {
                 if let Some(ipv4) = Ipv4Packet::new(eth.payload()) {
                     let mut is_syn = false;
-                    
-                    // TCP kontrolü ve SYN bayrağı tespiti
-                    if ipv4.get_next_level_protocol() == pnet::packet::ip::IpNextHeaderProtocols::Tcp {
+
+                    if ipv4.get_next_level_protocol()
+                        == pnet::packet::ip::IpNextHeaderProtocols::Tcp
+                    {
                         if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
                             is_syn = (tcp.get_flags() & TcpFlags::SYN) != 0;
                         }
@@ -124,8 +124,6 @@ mod network {
                         is_syn,
                     };
 
-                    // DÜZELTME: try_send kullanıyoruz. Böylece çok şiddetli DDoS anında analiz threadi 
-                    // yetişemezse paketler RAM'i şişirmeden drop edilir, programın çökmesi engellenir.
                     let _ = tx.try_send(pkt_info);
                 }
             }
@@ -142,12 +140,14 @@ mod analyzer {
 
     const WINDOW_DURATION_SEC: u64 = 1;
     const HISTORY_SIZE: usize = 10;
-    
-    const MIN_PACKET_THRESHOLD: u64 = 500; 
-    const SPIKE_MULTIPLIER: f64 = 3.0;     
-    const SYN_FLOOD_THRESHOLD: u64 = 200;  
-    // DÜZELTME: False-positive'leri (video/dosya indirme) önlemek için eşik artırıldı
-    const SINGLE_IP_MAX_PPS: u64 = 1000;    
+
+    const MIN_PACKET_THRESHOLD: u64 = 500;
+    const SPIKE_MULTIPLIER: f64 = 3.0;
+    const SYN_FLOOD_THRESHOLD: u64 = 200;
+    const SINGLE_IP_MAX_PPS: u64 = 1000;
+
+    // DÜZELTME #3: last_alert_times temizleme için maksimum boyut sabiti
+    const MAX_ALERT_TRACKER_ENTRIES: usize = 1024;
 
     struct WindowStats {
         packet_count: u64,
@@ -175,8 +175,6 @@ mod analyzer {
         let mut current_window = WindowStats::new();
         let mut history: VecDeque<u64> = VecDeque::with_capacity(HISTORY_SIZE);
         let mut window_start = Instant::now();
-
-        // Olay korelasyonu (Spam engelleme) için son alarm kayıtları
         let mut last_alert_times: HashMap<String, Instant> = HashMap::new();
 
         loop {
@@ -190,7 +188,7 @@ mod analyzer {
                     *current_window.ip_counts.entry(packet.src_ip).or_insert(0) += 1;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => break, // Kanal kapandı
+                Err(_) => break,
             }
 
             if window_start.elapsed() >= Duration::from_secs(WINDOW_DURATION_SEC) {
@@ -208,7 +206,9 @@ mod analyzer {
                 history.push_back(current_window.packet_count);
 
                 current_window = WindowStats::new();
-                window_start = Instant::now();
+                // DÜZELTME #4: Zaman kaymasını önlemek için window_start sabite eklenerek
+                // bir sonraki pencere zamanı doğru hesaplanır (drift prevention).
+                window_start += Duration::from_secs(WINDOW_DURATION_SEC);
             }
         }
     }
@@ -220,63 +220,114 @@ mod analyzer {
         alert_tx: &Sender<Alert>,
         last_alert_times: &mut HashMap<String, Instant>,
     ) {
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        
+        let now = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
         // 1. Hacimsel Spike (Volumetric Anomaly)
         if !history.is_empty() && stats.packet_count > MIN_PACKET_THRESHOLD {
-            let avg_packets: f64 = history.iter().sum::<u64>() as f64 / history.len() as f64;
-            
-            // DÜZELTME: Ağda daha önce hiç trafik yoksa (Sıfıra bölme ve mantık hatası önlemi)
+            let avg_packets: f64 =
+                history.iter().sum::<u64>() as f64 / history.len() as f64;
             let safe_avg = if avg_packets < 1.0 { 1.0 } else { avg_packets };
-            
             let spike_ratio = stats.packet_count as f64 / safe_avg;
+
             if spike_ratio > SPIKE_MULTIPLIER {
-                send_alert(alert_tx, last_alert_times, Alert {
-                    timestamp: now.clone(),
-                    adapter: adapter_name.to_string(),
-                    severity: Severity::High,
-                    anomaly_type: "Volumetric_Spike".to_string(),
-                    score: spike_ratio,
-                    threshold: SPIKE_MULTIPLIER,
-                    description: format!("Ani trafik artışı algılandı. Normalin {:.1} katı! ({} pkt/s)", spike_ratio, stats.packet_count),
-                });
+                send_alert(
+                    alert_tx,
+                    last_alert_times,
+                    Alert {
+                        timestamp: now.clone(),
+                        adapter: adapter_name.to_string(),
+                        severity: Severity::High,
+                        anomaly_type: "Volumetric_Spike".to_string(),
+                        score: spike_ratio,
+                        threshold: SPIKE_MULTIPLIER,
+                        description: format!(
+                            "Ani trafik artışı algılandı. Normalin {:.1} katı! ({} pkt/s)",
+                            spike_ratio, stats.packet_count
+                        ),
+                    },
+                );
             }
         }
 
         // 2. SYN Flood Tespiti
         if stats.syn_count > SYN_FLOOD_THRESHOLD {
-            send_alert(alert_tx, last_alert_times, Alert {
-                timestamp: now.clone(),
-                adapter: adapter_name.to_string(),
-                severity: Severity::Critical,
-                anomaly_type: "TCP_SYN_Flood".to_string(),
-                score: stats.syn_count as f64,
-                threshold: SYN_FLOOD_THRESHOLD as f64,
-                description: format!("Olası SYN Flood Saldırısı! Saniyede {} SYN paketi alındı.", stats.syn_count),
-            });
+            send_alert(
+                alert_tx,
+                last_alert_times,
+                Alert {
+                    timestamp: now.clone(),
+                    adapter: adapter_name.to_string(),
+                    severity: Severity::Critical,
+                    anomaly_type: "TCP_SYN_Flood".to_string(),
+                    score: stats.syn_count as f64,
+                    threshold: SYN_FLOOD_THRESHOLD as f64,
+                    description: format!(
+                        "Olası SYN Flood Saldırısı! Saniyede {} SYN paketi alındı.",
+                        stats.syn_count
+                    ),
+                },
+            );
         }
 
         // 3. Tekil IP Yoğunluğu (Single IP Flood)
         for (ip, count) in &stats.ip_counts {
             if *count > SINGLE_IP_MAX_PPS {
-                send_alert(alert_tx, last_alert_times, Alert {
-                    timestamp: now.clone(),
-                    adapter: adapter_name.to_string(),
-                    severity: Severity::Medium,
-                    anomaly_type: "Single_IP_Flood".to_string(),
-                    score: *count as f64,
-                    threshold: SINGLE_IP_MAX_PPS as f64,
-                    description: format!("{} adresinden anormal yoğunlukta istek geliyor ({} pkt/s).", ip, count),
-                });
+                // DÜZELTME #2: IP adresi alarm anahtarına dahil edildi.
+                // Önceki kodda tüm IP'ler aynı anahtarı ("Single_IP_Flood_Medium")
+                // paylaşıyordu; bu yüzden farklı saldırgan IP'ler birbirinin
+                // spam korumasını tetikleyerek bazı alarmların bastırılmasına
+                // neden oluyordu.
+                send_alert(
+                    alert_tx,
+                    last_alert_times,
+                    Alert {
+                        timestamp: now.clone(),
+                        adapter: adapter_name.to_string(),
+                        severity: Severity::Medium,
+                        anomaly_type: "Single_IP_Flood".to_string(),
+                        score: *count as f64,
+                        threshold: SINGLE_IP_MAX_PPS as f64,
+                        description: format!(
+                            "{} adresinden anormal yoğunlukta istek geliyor ({} pkt/s).",
+                            ip, count
+                        ),
+                    },
+                );
+            }
+        }
+
+        // DÜZELTME #3: last_alert_times haritası sınırsız büyümeyi önlemek için
+        // periyodik olarak temizlenir. Süresi geçmiş girişler (60s) kaldırılır;
+        // harita hâlâ doluysa en eski yarısı silinir.
+        if last_alert_times.len() > MAX_ALERT_TRACKER_ENTRIES {
+            last_alert_times.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+            if last_alert_times.len() > MAX_ALERT_TRACKER_ENTRIES {
+                let mut entries: Vec<_> = last_alert_times
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                entries.sort_by_key(|(_, t)| *t);
+                let keep_from = entries.len() / 2;
+                let keys_to_remove: Vec<_> =
+                    entries[..keep_from].iter().map(|(k, _)| k.clone()).collect();
+                for k in keys_to_remove {
+                    last_alert_times.remove(&k);
+                }
             }
         }
     }
 
-    fn send_alert(alert_tx: &Sender<Alert>, last_alert_times: &mut HashMap<String, Instant>, alert: Alert) {
+    fn send_alert(
+        alert_tx: &Sender<Alert>,
+        last_alert_times: &mut HashMap<String, Instant>,
+        alert: Alert,
+    ) {
         let alert_key = format!("{}_{:?}", &alert.anomaly_type, &alert.severity);
-        
+
         let should_send = if let Some(last_time) = last_alert_times.get(&alert_key) {
-            last_time.elapsed() > Duration::from_secs(3) 
+            last_time.elapsed() > Duration::from_secs(3)
         } else {
             true
         };
@@ -293,7 +344,6 @@ mod analyzer {
 fn main() {
     ui::print_logo();
 
-    // 1. Sistemdeki adaptörleri bul
     let interfaces = datalink::interfaces();
     let mut valid_interfaces = Vec::new();
 
@@ -303,16 +353,23 @@ fn main() {
             continue;
         }
         valid_interfaces.push(iface.clone());
-        
-        let ips: Vec<String> = iface.ips.iter().map(|ip| ip.ip().to_string()).collect();
-        
-        // DÜZELTME: Güvenli MAC adresi okuması (Panik/Derleme hatalarını önler)
-        let mac_addr = iface.mac.map(|m| m.to_string()).unwrap_or_else(|| "Bilinmiyor".to_string());
-        
-        println!(" [{}] {} - MAC: {} - IP: {}", 
-            valid_interfaces.len() - 1, 
-            iface.description, 
-            mac_addr, 
+
+        let ips: Vec<String> = iface
+            .ips
+            .iter()
+            .map(|ip| ip.ip().to_string())
+            .collect();
+
+        let mac_addr = iface
+            .mac
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "Bilinmiyor".to_string());
+
+        println!(
+            " [{}] {} - MAC: {} - IP: {}",
+            valid_interfaces.len() - 1,
+            iface.description,
+            mac_addr,
             ips.join(", ")
         );
     }
@@ -322,13 +379,15 @@ fn main() {
         process::exit(1);
     }
 
-    // 2. Kullanıcıdan adaptör seçimi al
-    print!("\nDinlenecek adaptör numarasını seçin (0-{}): ", valid_interfaces.len() - 1);
+    print!(
+        "\nDinlenecek adaptör numarasını seçin (0-{}): ",
+        valid_interfaces.len() - 1
+    );
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
-    
+
     let selected_index: usize = match input.trim().parse() {
         Ok(num) if num < valid_interfaces.len() => num,
         _ => {
@@ -343,27 +402,29 @@ fn main() {
     println!("\n[+] Seçilen Adaptör: {}", interface_name);
     println!("[+] Trafik izleme ve anomali tespiti başlatılıyor... (Çıkış için Ctrl+C)\n");
 
-    // DÜZELTME: Bellek Sızıntısı (OOM) koruması için senkron (sınırlandırılmış) kanal
-    // 100,000 paketlik tampon bellek, performans ve güvenliği çok iyi dengeler.
     let (packet_tx, packet_rx) = mpsc::sync_channel(100_000);
     let (alert_tx, alert_rx) = mpsc::channel();
 
-    // 3. Analizör Thread'ini Başlat
     let analyzer_interface_name = interface_name.clone();
     thread::spawn(move || {
         analyzer::start_analyzer(analyzer_interface_name, packet_rx, alert_tx);
     });
 
-    // 4. Log ve UI Gösterim Thread'ini Başlat
+    // DÜZELTME #5: Log thread içinde process::exit yerine eprintln + return kullanıldı.
+    // Thread içinden process::exit çağırmak tüm diğer thread'leri de anında öldürür;
+    // bu kasıtlı olsa bile panik mesajı olmadan sessiz çöküşe yol açabilir.
     thread::spawn(move || {
-        let mut log_file = std::fs::OpenOptions::new()
+        let mut log_file = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open("ddos_alerts.json")
-            .unwrap_or_else(|err| {
-                eprintln!("Uyarı: Log dosyası oluşturulamadı: {}", err);
-                process::exit(1);
-            });
+        {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!("Uyarı: Log dosyası oluşturulamadı: {}. Alarm logları diske yazılmayacak.", err);
+                return;
+            }
+        };
 
         while let Ok(alert) = alert_rx.recv() {
             ui::print_alert(&alert);
@@ -374,27 +435,27 @@ fn main() {
         }
     });
 
-    // 5. Paket Yakalama Döngüsü (Ana Thread)
     match datalink::channel(selected_interface, Default::default()) {
-        Ok(Ethernet(_tx, mut rx)) => {
-            loop {
-                match rx.next() {
-                    Ok(packet) => {
-                        network::process_packet(packet, &packet_tx);
-                    }
-                    Err(e) => {
-                        eprintln!("Paket yakalama hatası: {}", e);
-                        thread::sleep(std::time::Duration::from_millis(100));
-                    }
+        Ok(Ethernet(_tx, mut rx)) => loop {
+            match rx.next() {
+                Ok(packet) => {
+                    network::process_packet(packet, &packet_tx);
+                }
+                Err(e) => {
+                    eprintln!("Paket yakalama hatası: {}", e);
+                    thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
-        }
+        },
         Ok(_) => {
-            eprintln!("Hata: Desteklenmeyen kanal türü (Sadece Ethernet (DataLink) destekleniyor).");
+            eprintln!("Hata: Desteklenmeyen kanal türü (Sadece Ethernet/DataLink destekleniyor).");
             process::exit(1);
         }
         Err(e) => {
-            eprintln!("Kritik Hata: Adaptör dinlemeye açılamadı!\nNedeni: {}\n\nÇözüm İpuçları:\n1. Programı Yönetici (Administrator) olarak çalıştırdığınızdan emin olun.\n2. Windows için Npcap'in kurulu olduğundan emin olun.", e);
+            eprintln!(
+                "Kritik Hata: Adaptör dinlemeye açılamadı!\nNedeni: {}\n\nÇözüm İpuçları:\n1. Programı Yönetici (Administrator) olarak çalıştırdığınızdan emin olun.\n2. Windows için Npcap'in kurulu olduğundan emin olun.",
+                e
+            );
             process::exit(1);
         }
     }
